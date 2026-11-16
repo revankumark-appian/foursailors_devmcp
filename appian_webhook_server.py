@@ -38,6 +38,7 @@ Run it with:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -50,6 +51,8 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from pathlib import Path
+
 from appian_mcp_client import (
     McpError,
     McpHub,
@@ -57,6 +60,29 @@ from appian_mcp_client import (
     McpToolError,
     McpUnavailableError,
 )
+
+
+def _load_dotenv(path: Path) -> None:
+    """Load KEY=VALUE lines from a .env file into os.environ.
+
+    Dependency-free and deliberately minimal. A variable already present in the
+    real environment is left untouched, so an explicit `VAR=... uv run ...`
+    override always wins over the file.
+    """
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_dotenv(Path(__file__).resolve().parent / ".env")
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -81,6 +107,15 @@ AUTOSTART_MCP = os.getenv("MCP_AUTOSTART", "true").lower() in {"1", "true", "yes
 
 DEFAULT_EXPANSION_DEPTH = int(os.getenv("EXPANSION_DEPTH", "1"))
 DEFAULT_MAX_OBJECTS = int(os.getenv("MAX_PACKAGE_OBJECTS", "40"))
+
+# Deployment (source -> target promotion via the Deployment MCP).
+# The labels must match the environment names the Deployment MCP exposes
+# (APPIAN_<ENV>_DOMAIN in mcp.json -> lowercased name).
+SOURCE_ENV = os.getenv("DEPLOY_SOURCE_ENV", "source")
+TARGET_ENV = os.getenv("DEPLOY_TARGET_ENV", "target")
+DEPLOY_MAX_FIX_ITERATIONS = int(os.getenv("DEPLOY_MAX_FIX_ITERATIONS", "3"))
+DEPLOY_POLL_INTERVAL = int(os.getenv("DEPLOY_POLL_INTERVAL", "5"))
+DEPLOY_POLL_TIMEOUT = int(os.getenv("DEPLOY_POLL_TIMEOUT", "600"))
 
 # Tools tried, in order, to discover an object's type from a bare UUID.
 TYPE_PROBES: tuple[tuple[str, str], ...] = (
@@ -189,6 +224,17 @@ def _localized(value: Any) -> str | None:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_env_names(envs: Any) -> list[str]:
+    """Extract environment names from a Deployment MCP `list_environments` result.
+
+    The tool returns either a dict like `{"environments": ["source", "target"]}`
+    or, defensively, a bare list. Anything else yields an empty list.
+    """
+    if isinstance(envs, dict):
+        envs = envs.get("environments", [])
+    return [str(n) for n in envs] if isinstance(envs, list) else []
 
 
 # --------------------------------------------------------------------------- #
@@ -489,6 +535,13 @@ class ApplicationNotFoundError(WorkflowError):
     code = "application_not_found"
 
 
+class DeploymentError(WorkflowError):
+    """An export or deploy step failed, timed out, or returned an error status."""
+
+    http_status = status.HTTP_502_BAD_GATEWAY
+    code = "deployment_failed"
+
+
 def http_status_for(exc: BaseException) -> int:
     """Translate any workflow or MCP failure into a response status code."""
     if isinstance(exc, WorkflowError):
@@ -682,6 +735,37 @@ class RunReport(BaseModel):
     http_status: int | None = None
     started_at: str = Field(default_factory=_now)
     finished_at: str | None = None
+
+    # --- Deployment (populated by the on-demand deploy workflow) --- #
+    # Separate from the packaging `state`/`steps` above: a run can succeed at
+    # packaging and later be deployed (or re-deployed) independently.
+    # "needs_attention" means inspection surfaced errors the auto-fix loop could
+    # not resolve - the package exists but was deliberately not deployed.
+    deploy_state: Literal["none", "running", "succeeded", "failed", "needs_attention"] = "none"
+    deploy_target_env: str | None = None
+    export_uuid: str | None = None
+    inspection_uuid: str | None = None
+    deploy_uuid: str | None = None
+    deploy_log: str | None = None
+    deploy_error: str | None = None
+    deploy_error_code: str | None = None
+    deploy_steps: list[StepReport] = Field(default_factory=list)
+    deploy_started_at: str | None = None
+    deploy_finished_at: str | None = None
+
+
+class DeployRequest(BaseModel):
+    """Body for POST /runs/{run_id}/deploy - promote a finished run's package.
+
+    `extra="forbid"` keeps the deploy contract explicit, matching the inbound
+    webhook models. Inspection is on by default (3-a); `inspect_first=False`
+    would deploy without the inspect gate, which also disables the auto-fix loop.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_env: str = Field(..., min_length=1, max_length=120)
+    inspect_first: bool = True
 
 
 class WebhookAccepted(BaseModel):
@@ -1300,8 +1384,7 @@ class PackagingWorkflow:
             step.finished_at = _now()
             return
 
-        names = envs.get("environments", []) if isinstance(envs, dict) else envs
-        names = [str(n) for n in names] if isinstance(names, list) else []
+        names = normalize_env_names(envs)
         known = any(n.casefold() == target.casefold() for n in names)
         step.status = "ok" if known else "warning"
         step.detail = (
@@ -1332,6 +1415,603 @@ class PackagingWorkflow:
 
 
 # --------------------------------------------------------------------------- #
+# Deployment workflow (on-demand promotion of a finished run's package)
+# --------------------------------------------------------------------------- #
+def _deploy_terminal_result(poll_result: Any) -> dict[str, Any]:
+    """Unwrap a poll_deployment_status response into its inner result dict.
+
+    poll_deployment_status returns {completed, timed_out, elapsed_seconds, result}.
+    This returns the inner `result` (the actual deployment record) as a dict,
+    or an empty dict if the shape is unexpected.
+    """
+    if isinstance(poll_result, dict):
+        inner = poll_result.get("result")
+        if isinstance(inner, dict):
+            return inner
+        return poll_result
+    return {}
+
+
+def _is_error_status(status_text: str) -> bool:
+    """True when a terminal deployment status indicates failure."""
+    s = (status_text or "").upper()
+    return s in {
+        "FAILED",
+        "REJECTED",
+        "COMPLETED_WITH_ERRORS",
+        "COMPLETED_WITH_IMPORT_ERRORS",
+        "COMPLETED_WITH_PUBLISH_ERRORS",
+        "COMPLETED_WITH_EXPORT_ERRORS",
+    }
+
+
+# Keys an inspection payload might use for the problems/errors collection. The
+# clean-case shape is confirmed (summary.problems.totalErrors); the error-case
+# detail shape is not fully known, so parsing is deliberately defensive.
+_INSPECTION_PROBLEM_KEYS = ("problems", "errors", "issues", "validationErrors")
+
+
+def summarize_inspection(result: Any) -> dict[str, Any]:
+    """Normalize a completed inspection result into a decision-ready summary.
+
+    Returns a dict with:
+      - clean: bool            - True only when the inspection ran and found no errors
+      - error_count: int       - number of errors reported (best effort)
+      - warning_count: int
+      - problems: list[dict]    - per-problem detail entries, best effort, each
+                                  carrying at least a `message`
+      - raw: the original result
+      - api_error: str | None   - set when the inspection itself errored (not a
+                                  package problem), e.g. APNX-1-4552-005
+
+    Defensive by design: when the error detail cannot be parsed, `clean` is False
+    and the raw payload is preserved so the caller can surface it verbatim.
+    """
+    out: dict[str, Any] = {
+        "clean": False,
+        "error_count": 0,
+        "warning_count": 0,
+        "problems": [],
+        "raw": result,
+        "api_error": None,
+    }
+    if not isinstance(result, dict):
+        out["api_error"] = "inspection returned an unexpected (non-dict) result"
+        return out
+
+    # The deployment MCP wraps a REST/API failure as {"error": true, "message": ...}.
+    if result.get("error"):
+        out["api_error"] = str(result.get("message") or "inspection reported an error")
+        return out
+
+    status = str(result.get("status", "")).upper()
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    problems_summary = summary.get("problems") if isinstance(summary.get("problems"), dict) else {}
+
+    error_count = problems_summary.get("totalErrors")
+    warning_count = problems_summary.get("totalWarnings")
+    out["error_count"] = int(error_count) if isinstance(error_count, int) else 0
+    out["warning_count"] = int(warning_count) if isinstance(warning_count, int) else 0
+
+    # Collect the detailed ERROR entries. Appian's real shape nests them at
+    # summary.problems.errors (warnings at .warnings), confirmed against a live
+    # inspection. `problems` here holds only error-level entries, since those are
+    # what drive the auto-fix loop - warnings are advisory and never block.
+    problems: list[dict[str, Any]] = []
+
+    def _collect(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    problems.append(item)
+                elif item:
+                    problems.append({"message": str(item)})
+
+    # Primary: nested error lists inside summary.problems (the real shape).
+    for key in ("errors", "validationErrors", "issues"):
+        _collect(problems_summary.get(key))
+    # Fallbacks for older/alternative shapes: a `problems` (or errors/issues) list
+    # living directly on the result or summary rather than nested.
+    for key in _INSPECTION_PROBLEM_KEYS:
+        value = result.get(key) if key in result else summary.get(key)
+        if isinstance(value, list):  # only a bare list; the dict form is handled above
+            _collect(value)
+
+    out["problems"] = problems
+
+    # Clean only when the inspection completed and reported zero errors. If the
+    # count key was missing but detailed error entries were found, treat as not clean.
+    counted_errors = out["error_count"] or len(problems)
+    out["error_count"] = out["error_count"] or (len(problems) if problems else 0)
+    out["clean"] = status == "COMPLETED" and counted_errors == 0 and out["api_error"] is None
+    return out
+
+
+# A UUID as it appears in Appian problem text: either a plain 8-4-4-4-12 or the
+# prefixed design-object form like _a-0000...-_8278.
+_UUID_IN_TEXT_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"|_[a-z]-[0-9a-zA-Z]+(?:-[0-9a-zA-Z]+)*_\d+"
+)
+
+# Fields a problem entry might carry a referenced object's identity in.
+_PROBLEM_UUID_FIELDS = ("uuid", "objectUuid", "object_uuid", "referenceUuid", "missingUuid")
+_PROBLEM_NAME_FIELDS = ("name", "objectName", "object_name", "referenceName", "missingName")
+
+
+def extract_missing_refs(problems: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Pull candidate object references (uuid and/or name) out of problem entries.
+
+    Deliberately permissive: the exact inspection-error shape is not verified, so
+    this looks at known id/name fields AND regex-scans every string value for a
+    UUID. Each returned ref is {uuid?, name?, message}. The caller decides which
+    of these actually resolve to real source objects (3-b).
+    """
+    refs: list[dict[str, str]] = []
+    for prob in problems:
+        if not isinstance(prob, dict):
+            continue
+        message = str(
+            prob.get("message") or prob.get("errorMessage") or prob.get("warningMessage")
+            or prob.get("detail") or prob.get("description") or prob
+        )
+        ref: dict[str, str] = {"message": message[:400]}
+
+        for f in _PROBLEM_UUID_FIELDS:
+            v = prob.get(f)
+            if isinstance(v, str) and v.strip():
+                ref["uuid"] = v.strip()
+                break
+        for f in _PROBLEM_NAME_FIELDS:
+            v = prob.get(f)
+            if isinstance(v, str) and v.strip():
+                ref["name"] = v.strip()
+                break
+
+        # Fall back to scanning text for a UUID if no explicit field carried one.
+        if "uuid" not in ref:
+            for value in prob.values():
+                if isinstance(value, str):
+                    m = _UUID_IN_TEXT_RE.search(value)
+                    if m:
+                        ref["uuid"] = m.group(0)
+                        break
+        refs.append(ref)
+    return refs
+
+
+class DeploymentWorkflow:
+    """Promotes a finished run's package from the source to the target env.
+
+    Happy path only at this stage (Task 4): export -> poll -> download ->
+    deploy -> poll -> results + log. The inspection gate (Task 6) and the
+    auto-fix loop (Task 7) slot in between export and deploy later.
+
+    Results are recorded onto the SAME RunReport as packaging, under the
+    `deploy_*` fields and `deploy_steps`, so a run carries its whole history.
+    """
+
+    def __init__(self, hub: McpHub):
+        self.hub = hub
+
+    async def _deploy(self, tool: str, args: dict[str, Any] | None = None, *, timeout: float | None = None) -> Any:
+        return await self.hub.call(DEPLOY_MCP, tool, args or {}, timeout=timeout)
+
+    async def _dev(self, tool: str, args: dict[str, Any] | None = None) -> Any:
+        """Call the Dev MCP - used by the auto-fix loop to resolve + add objects."""
+        return await self.hub.call(DEV_MCP, tool, args or {})
+
+    async def _load_inventory(self, app_uuid: str) -> dict[str, dict[str, Any]]:
+        """uuid -> {name, type} for every packageable object in the app.
+
+        Mirrors PackagingWorkflow._load_inventory; used by the auto-fix loop to
+        decide which missing references map to real source objects (3-b).
+        """
+        listing = await self._dev(
+            "listApplicationObjects",
+            {"appUuid": app_uuid, "objectTypes": list(APP_INVENTORY_KEYS)},
+        )
+        inventory: dict[str, dict[str, Any]] = {}
+        if not isinstance(listing, dict):
+            return inventory
+        for key, obj_type in APP_INVENTORY_KEYS.items():
+            bucket = listing.get(key)
+            if not isinstance(bucket, dict):
+                continue
+            for item in bucket.get("items") or []:
+                if not isinstance(item, dict) or not item.get("uuid"):
+                    continue
+                inventory[str(item["uuid"])] = {
+                    "name": _localized(item.get("name")),
+                    "type": obj_type,
+                }
+        return inventory
+
+    def _step(self, report: RunReport, name: str) -> StepReport:
+        step = StepReport(name=name, status="running", started_at=_now())
+        report.deploy_steps.append(step)
+        return step
+
+    async def _poll(self, deployment_uuid: str, environment: str) -> dict[str, Any]:
+        """Poll a deployment to a terminal status on the given environment.
+
+        Leans on the Deployment MCP's own poll_deployment_status (server-side
+        loop), giving the outer MCP call a budget a bit beyond the poll timeout.
+        """
+        poll = await self._deploy(
+            "poll_deployment_status",
+            {
+                "deployment_uuid": deployment_uuid,
+                "poll_interval_seconds": DEPLOY_POLL_INTERVAL,
+                "max_wait_seconds": DEPLOY_POLL_TIMEOUT,
+                "environment": environment,
+            },
+            timeout=DEPLOY_POLL_TIMEOUT + 60,
+        )
+        if isinstance(poll, dict) and poll.get("timed_out"):
+            raise DeploymentError(
+                f"deployment {deployment_uuid} did not reach a terminal status within "
+                f"{DEPLOY_POLL_TIMEOUT}s on {environment}",
+                details=_deploy_terminal_result(poll),
+            )
+        return _deploy_terminal_result(poll)
+
+    async def run(self, report: RunReport, target_env: str, *, inspect_first: bool = True) -> RunReport:
+        """Promote report.package_uuid from SOURCE_ENV to target_env.
+
+        When `inspect_first` is set (the default), the package is inspected on the
+        target before deploying. On a clean inspection the deploy proceeds.
+
+        When inspection reports errors, the auto-fix loop runs: missing-object
+        references are parsed from the problems, resolved against the SOURCE
+        application inventory, and the fixable ones added to the package; the
+        package is then re-exported and re-inspected. This repeats up to
+        DEPLOY_MAX_FIX_ITERATIONS times. The loop stops - ending in
+        `deploy_state="needs_attention"` without deploying and without raising -
+        when an error cannot be mapped to a real source object (3-b), when a pass
+        adds nothing new (fixed point), or when the iteration cap is reached.
+        """
+        report.deploy_state = "running"
+        report.deploy_target_env = target_env
+        report.deploy_started_at = _now()
+        report.deploy_error = None
+        report.deploy_error_code = None
+        try:
+            export_uuid = await self._step_export(report)
+            package_path = await self._step_download(report, export_uuid)
+
+            if inspect_first:
+                package_path = await self._inspect_and_autofix(report, target_env, package_path)
+                if package_path is None:
+                    # Inspection errors could not be auto-resolved. Controlled
+                    # stop (not a failure): the package exists, just not deployed.
+                    report.deploy_state = "needs_attention"
+                    report.deploy_finished_at = _now()
+                    log.warning("[%s] inspection unresolved; deploy withheld (needs_attention)", report.run_id)
+                    return report
+
+            await self._step_deploy(report, target_env, package_path)
+        except BaseException as exc:  # noqa: BLE001 - recorded on the run report
+            report.deploy_state = "failed"
+            report.deploy_error = str(exc)
+            report.deploy_error_code = error_code_for(exc)
+            report.deploy_finished_at = _now()
+            if report.deploy_steps and report.deploy_steps[-1].status == "running":
+                report.deploy_steps[-1].status = "failed"
+                report.deploy_steps[-1].detail = str(exc)
+                report.deploy_steps[-1].finished_at = _now()
+            log.error("[%s] deploy failed: %s", report.run_id, exc)
+            raise
+        report.deploy_state = "succeeded"
+        report.deploy_finished_at = _now()
+        log.info("[%s] deployed %s to %s as %s", report.run_id, report.package_uuid, target_env, report.deploy_uuid)
+        return report
+
+    async def _inspect_and_autofix(
+        self, report: RunReport, target_env: str, package_path: str
+    ) -> str | None:
+        """Inspect; on errors, try to add missing source objects and re-inspect.
+
+        Returns the package file path to deploy when the inspection is clean, or
+        None when the errors could not be resolved (caller sets needs_attention).
+        Up to DEPLOY_MAX_FIX_ITERATIONS fix passes follow the first inspection.
+        """
+        inventory: dict[str, dict[str, Any]] | None = None
+
+        for attempt in range(DEPLOY_MAX_FIX_ITERATIONS + 1):
+            summary = await self._step_inspect(report, target_env, package_path)
+            if summary["clean"]:
+                return package_path
+
+            # An inspection the result of which we cannot read is not fixable.
+            if summary["api_error"]:
+                return None
+            if attempt >= DEPLOY_MAX_FIX_ITERATIONS:
+                return None  # out of fix passes; surface remaining errors
+
+            # Load the source inventory once, lazily.
+            if inventory is None:
+                if not report.application_uuid:
+                    return None  # cannot resolve without the source application
+                inventory = await self._load_inventory(report.application_uuid)
+
+            added = await self._step_autofix(report, summary, inventory)
+            if not added:
+                return None  # nothing fixable -> surface the errors (3-b)
+
+            # Re-export with the enlarged package, then loop to re-inspect.
+            export_uuid = await self._step_export(report)
+            package_path = await self._step_download(report, export_uuid)
+
+        return None
+
+    async def _step_autofix(
+        self, report: RunReport, summary: dict[str, Any], inventory: dict[str, dict[str, Any]]
+    ) -> list[dict[str, str]]:
+        """Resolve missing refs against source inventory and add them to the package.
+
+        An error is fixable only when the missing object it names resolves to a
+        real object in the SOURCE application inventory that is not already in the
+        package (3-b). Returns the list of objects actually added (empty = nothing
+        could be fixed).
+        """
+        step = self._step(report, "autofix_add_objects")
+        refs = extract_missing_refs(summary.get("problems") or [])
+
+        # Which objects are already in the package? Track by uuid across passes.
+        already = {o.uuid for o in report.selected if o.uuid}
+
+        to_add: dict[str, dict[str, str]] = {}
+        unresolved: list[dict[str, str]] = []
+        for ref in refs:
+            resolved = self._resolve_ref_in_inventory(ref, inventory)
+            if resolved is None:
+                unresolved.append(ref)
+                continue
+            uuid, meta = resolved
+            if uuid in already or uuid in to_add:
+                continue
+            to_add[uuid] = {"uuid": uuid, "type": meta.get("type", ""), "name": meta.get("name") or ""}
+
+        step.data = {
+            "problems": summary.get("problems"),
+            "refs": refs,
+            "resolved": list(to_add.values()),
+            "unresolved": unresolved,
+        }
+
+        if not to_add:
+            step.status = "warning"
+            step.detail = "no missing object resolved to a real source object; nothing to add"
+            step.finished_at = _now()
+            log.warning("[%s] Deploy step autofix: %s", report.run_id, step.detail)
+            return []
+
+        objects = [{"uuid": o["uuid"], "type": o["type"]} for o in to_add.values() if o["type"]]
+        result = await self._dev("addPackageObjects", {"uuid": report.package_uuid, "objects": objects})
+        if isinstance(result, dict) and (result.get("error") or result.get("failed")):
+            step.status = "failed"
+            step.detail = f"addPackageObjects reported a problem: {result.get('message') or result.get('failed')}"
+            step.finished_at = _now()
+            raise DeploymentError(step.detail, details=result)
+
+        # Reflect the added objects on the run so later passes and the UI see them.
+        for o in to_add.values():
+            report.selected.append(
+                SelectedObject(uuid=o["uuid"], name=o["name"] or None, type=o["type"] or None,
+                               origin="dependent", reason="added by deploy auto-fix (missing precedent)", depth=0)
+            )
+
+        names = ", ".join(o["name"] or o["uuid"] for o in to_add.values())
+        step.status = "ok"
+        step.detail = f"added {len(to_add)} missing object(s): {names}"
+        if unresolved:
+            step.detail += f"; {len(unresolved)} problem(s) not mappable to source objects"
+        step.finished_at = _now()
+        log.info("[%s] Deploy step autofix: %s", report.run_id, step.detail)
+        return list(to_add.values())
+
+    @staticmethod
+    def _resolve_ref_in_inventory(
+        ref: dict[str, str], inventory: dict[str, dict[str, Any]]
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Map a missing-object ref to a real source object, or None (3-b).
+
+        Prefer an exact UUID hit; fall back to a unique case-insensitive name
+        match. A name that matches several objects is treated as unresolved
+        rather than guessed.
+        """
+        uuid = ref.get("uuid")
+        if uuid and uuid in inventory:
+            return uuid, inventory[uuid]
+
+        name = (ref.get("name") or "").strip().casefold()
+        if name:
+            matches = [(u, m) for u, m in inventory.items() if (m.get("name") or "").strip().casefold() == name]
+            if len(matches) == 1:
+                return matches[0]
+        return None
+
+    # -- Export from source ------------------------------------------------- #
+    async def _step_export(self, report: RunReport) -> str:
+        step = self._step(report, "export_package")
+        if not report.package_uuid:
+            raise ConfigurationError("run has no package_uuid to export")
+
+        name = f"{report.ticket_id} export to {report.deploy_target_env}"[:255]
+        created = await self._deploy(
+            "export_package",
+            {
+                "uuids": [report.package_uuid],
+                "export_type": "package",
+                "name": name,
+                "description": f"Automated export of {report.package_name or report.package_uuid}",
+                "environment": SOURCE_ENV,
+            },
+        )
+        # Record the raw response before validating, so a failure is diagnosable.
+        step.data = {"created": created}
+        if isinstance(created, dict) and created.get("error"):
+            raise DeploymentError(f"export_package failed: {created.get('message', created)}", details=created)
+        if not isinstance(created, dict) or not created.get("uuid"):
+            raise DeploymentError("export_package did not return a deployment UUID", details=created)
+
+        export_uuid = str(created["uuid"])
+        report.export_uuid = export_uuid
+
+        terminal = await self._poll(export_uuid, SOURCE_ENV)
+        export_status = str(terminal.get("status", ""))
+        if _is_error_status(export_status):
+            raise DeploymentError(f"export finished with status {export_status!r}", details=terminal)
+
+        step.status = "ok"
+        step.detail = f"exported package from {SOURCE_ENV} (status {export_status or 'COMPLETED'})"
+        step.data = {"export_uuid": export_uuid, "created": created, "terminal": terminal}
+        step.finished_at = _now()
+        log.info("[%s] Deploy step export: %s (%s)", report.run_id, step.detail, export_uuid)
+        return export_uuid
+
+    # -- Download the exported package zip ---------------------------------- #
+    async def _step_download(self, report: RunReport, export_uuid: str) -> str:
+        step = self._step(report, "download_exported_package")
+        # Force a .zip filename: the export URL can end in "package-zip" (no
+        # extension), and deploy_package infers the multipart content type from
+        # the name - without ".zip" the target rejects it (APNX-1-4552-019).
+        result = await self._deploy(
+            "download_exported_package",
+            {
+                "deployment_uuid": export_uuid,
+                "filename": f"{export_uuid}.zip",
+                "environment": SOURCE_ENV,
+            },
+        )
+        if not isinstance(result, dict) or result.get("error") or not result.get("file_path"):
+            raise DeploymentError("could not download the exported package", details=result)
+
+        file_path = str(result["file_path"])
+        step.status = "ok"
+        step.detail = f"downloaded exported package ({result.get('file_size_bytes', '?')} bytes)"
+        step.data = {"file_path": file_path, "file_size_bytes": result.get("file_size_bytes")}
+        step.finished_at = _now()
+        log.info("[%s] Deploy step download: %s", report.run_id, file_path)
+        return file_path
+
+    # -- Inspect on target (gate before deploy) ----------------------------- #
+    async def _step_inspect(self, report: RunReport, target_env: str, package_path: str) -> dict[str, Any]:
+        """Inspect the package on the target. Return the inspection summary dict.
+
+        A clean inspection has summary["clean"] True and the deploy proceeds. Any
+        errors, or an inspection the result of which cannot be read, have
+        summary["clean"] False; the caller runs the auto-fix loop or withholds
+        the deploy. The problems are recorded on the step and the run's
+        inspection_uuid is set.
+        """
+        step = self._step(report, "inspect_package")
+        created = await self._deploy(
+            "inspect_package",
+            {"package_file_path": package_path, "environment": target_env},
+        )
+        step.data = {"created": created}
+        if isinstance(created, dict) and created.get("error"):
+            raise DeploymentError(f"inspect_package failed: {created.get('message', created)}", details=created)
+        if not isinstance(created, dict) or not created.get("uuid"):
+            raise DeploymentError("inspect_package did not return an inspection UUID", details=created)
+
+        inspection_uuid = str(created["uuid"])
+        report.inspection_uuid = inspection_uuid
+
+        poll = await self._deploy(
+            "poll_inspection_status",
+            {
+                "inspection_uuid": inspection_uuid,
+                "poll_interval_seconds": DEPLOY_POLL_INTERVAL,
+                "max_wait_seconds": DEPLOY_POLL_TIMEOUT,
+                "environment": target_env,
+            },
+            timeout=DEPLOY_POLL_TIMEOUT + 60,
+        )
+        if isinstance(poll, dict) and poll.get("timed_out"):
+            raise DeploymentError(
+                f"inspection {inspection_uuid} did not finish within {DEPLOY_POLL_TIMEOUT}s on {target_env}",
+                details=_deploy_terminal_result(poll),
+            )
+        result = _deploy_terminal_result(poll)
+        summary = summarize_inspection(result)
+        step.data = {"inspection_uuid": inspection_uuid, "summary": summary, "result": result}
+
+        if summary["clean"]:
+            step.status = "ok"
+            step.detail = (
+                f"inspection clean ({summary['warning_count']} warning(s))"
+                if summary["warning_count"]
+                else "inspection clean, no problems"
+            )
+            step.finished_at = _now()
+            log.info("[%s] Deploy step inspect: %s", report.run_id, step.detail)
+            return summary
+
+        # Not clean: record the reason. The caller decides whether to auto-fix.
+        step.status = "warning"
+        if summary["api_error"]:
+            step.detail = f"inspection could not be completed: {summary['api_error']}"
+        else:
+            step.detail = (
+                f"inspection found {summary['error_count']} error(s), "
+                f"{summary['warning_count']} warning(s)"
+            )
+        step.finished_at = _now()
+        log.warning("[%s] Deploy step inspect: %s", report.run_id, step.detail)
+        return summary
+
+    # -- Deploy to target --------------------------------------------------- #
+    async def _step_deploy(self, report: RunReport, target_env: str, package_path: str) -> None:
+        step = self._step(report, "deploy_package")
+        name = f"{report.ticket_id} deploy to {target_env}"[:255]
+        created = await self._deploy(
+            "deploy_package",
+            {
+                "name": name,
+                "package_file_path": package_path,
+                "description": f"Automated deploy of {report.package_name or report.package_uuid}",
+                "environment": target_env,
+            },
+        )
+        step.data = {"created": created}
+        if isinstance(created, dict) and created.get("error"):
+            raise DeploymentError(f"deploy_package failed: {created.get('message', created)}", details=created)
+        if not isinstance(created, dict) or not created.get("uuid"):
+            raise DeploymentError("deploy_package did not return a deployment UUID", details=created)
+
+        deploy_uuid = str(created["uuid"])
+        report.deploy_uuid = deploy_uuid
+
+        terminal = await self._poll(deploy_uuid, target_env)
+        deploy_status = str(terminal.get("status", ""))
+
+        # Fetch the log regardless of outcome - it is the most useful artifact.
+        try:
+            log_text = await self._deploy(
+                "get_deployment_log", {"deployment_uuid": deploy_uuid, "environment": target_env}
+            )
+            report.deploy_log = log_text if isinstance(log_text, str) else json.dumps(log_text)
+        except (McpError, WorkflowError) as exc:
+            report.deploy_log = f"(could not fetch deployment log: {exc})"
+
+        step.data = {"deploy_uuid": deploy_uuid, "created": created, "terminal": terminal}
+
+        if _is_error_status(deploy_status):
+            step.status = "failed"
+            step.detail = f"deploy finished with status {deploy_status!r}"
+            step.finished_at = _now()
+            raise DeploymentError(f"deploy finished with status {deploy_status!r}", details=terminal)
+
+        step.status = "ok"
+        step.detail = f"deployed to {target_env} (status {deploy_status or 'COMPLETED'})"
+        step.finished_at = _now()
+        log.info("[%s] Deploy step deploy: %s (%s)", report.run_id, step.detail, deploy_uuid)
+
+
+# --------------------------------------------------------------------------- #
 # App wiring
 # --------------------------------------------------------------------------- #
 # MCP_CONFIG_PATHS lets this point at an alternative mcp.json - for example an
@@ -1340,6 +2020,7 @@ _config_paths = [p for p in os.getenv("MCP_CONFIG_PATHS", "").split(os.pathsep) 
 hub = McpHub.from_config_files(_config_paths or None)
 store = RunStore()
 workflow = PackagingWorkflow(hub)
+deployment = DeploymentWorkflow(hub)
 _background: set[asyncio.Task] = set()  # strong refs so tasks are not garbage collected
 
 
@@ -1466,6 +2147,113 @@ async def _run_detached(payload: JiraWebhookPayload, report: RunReport) -> None:
         log.warning("[%s] run finished with state=%s (%s)", report.run_id, report.state, report.error_code)
 
 
+async def _deploy_detached(report: RunReport, target_env: str, inspect_first: bool) -> None:
+    """Background entry point for a deploy: failures live on the run report."""
+    try:
+        await deployment.run(report, target_env, inspect_first=inspect_first)
+    except BaseException:  # noqa: BLE001 - already recorded by deployment.run
+        log.warning(
+            "[%s] deploy finished with deploy_state=%s (%s)",
+            report.run_id, report.deploy_state, report.deploy_error_code,
+        )
+
+
+@app.post(
+    "/runs/{run_id}/deploy",
+    responses={
+        200: {"description": "Deploy ran inline (sync) and finished"},
+        202: {"description": "Deploy accepted and running in the background"},
+        404: {"description": "No such run"},
+        409: {"description": "Run has no package, or a deploy is already running"},
+        422: {"description": "Run did not succeed, or target_env is unknown"},
+        502: {"description": "An Appian MCP tool failed"},
+        503: {"description": "The Deployment MCP is not connected"},
+        504: {"description": "A deployment timed out"},
+    },
+)
+async def deploy_run(
+    run_id: str,
+    body: DeployRequest,
+    request: Request,
+    sync: bool = Query(False, description="Run the deploy inline and return its terminal status code"),
+    x_webhook_token: str | None = Header(default=None, alias="X-Webhook-Token"),
+):
+    """Promote a finished run's package from the source env to `target_env`."""
+    _require_token(x_webhook_token)
+
+    report = store.get(run_id)
+    if report is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"No run {run_id!r}")
+
+    # The run must have produced a package to deploy.
+    if report.state != "succeeded" or not report.package_uuid:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Run {run_id!r} has no deployable package (state={report.state!r}, "
+            f"package_uuid={report.package_uuid!r}). Package it successfully first.",
+        )
+
+    # Refuse to start a second deploy while one is in flight for this run.
+    if report.deploy_state == "running":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"A deploy is already running for run {run_id!r}.",
+        )
+
+    # Validate the target against what the Deployment MCP actually knows.
+    try:
+        envs = await hub.call(DEPLOY_MCP, "list_environments", {})
+    except McpError as exc:
+        raise HTTPException(http_status_for(exc), f"Deployment MCP unavailable: {exc}") from exc
+    known = normalize_env_names(envs)
+    if not any(n.casefold() == body.target_env.casefold() for n in known):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"Unknown target_env {body.target_env!r}. Configured environments: {', '.join(known) or 'none'}.",
+        )
+    if body.target_env.casefold() == SOURCE_ENV.casefold():
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"target_env {body.target_env!r} is the source environment; choose a different target.",
+        )
+
+    log.info("[%s] deploy requested -> %s (sync=%s)", run_id, body.target_env, sync)
+
+    if sync:
+        try:
+            await deployment.run(report, body.target_env, inspect_first=body.inspect_first)
+        except BaseException as exc:  # noqa: BLE001 - mapped onto a status code
+            return JSONResponse(
+                status_code=http_status_for(exc),
+                content={
+                    "action": "failed",
+                    "error_code": error_code_for(exc),
+                    "error": str(exc),
+                    "details": getattr(exc, "details", None),
+                    "run": report.model_dump(),
+                },
+            )
+        return JSONResponse(status_code=status.HTTP_200_OK, content={"action": "completed", "run": report.model_dump()})
+
+    # Detached: flip state to running now so an immediate re-POST is rejected.
+    report.deploy_state = "running"
+    report.deploy_target_env = body.target_env
+    task = asyncio.create_task(_deploy_detached(report, body.target_env, body.inspect_first), name=f"deploy:{run_id}")
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "action": "accepted",
+            "run_id": run_id,
+            "target_env": body.target_env,
+            "status_url": str(request.url_for("get_run", run_id=run_id)),
+            "message": f"Deploy of run {run_id} to {body.target_env} started.",
+        },
+    )
+
+
 @app.get("/runs/{run_id}", name="get_run")
 async def get_run(run_id: str) -> RunReport:
     report = store.get(run_id)
@@ -1482,8 +2270,12 @@ async def list_runs(limit: int = Query(20, ge=1, le=200)) -> list[RunReport]:
 @app.get("/healthz")
 async def healthz():
     mcp_status = hub.status()
+    # Only the Dev MCP gates health: packaging is the core function. The
+    # Deployment MCP is reported but never degrades health, since deploy is a
+    # manual, optional action layered on top of packaging.
     required = [DEV_MCP]
     healthy = all(mcp_status.get(name, {}).get("connected") for name in required)
+    deploy_status = mcp_status.get(DEPLOY_MCP, {"connected": False, "error": "not configured", "toolCount": 0})
     return JSONResponse(
         status_code=status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE,
         content={
@@ -1492,8 +2284,28 @@ async def healthz():
             "defaultApplicationUuid": DEFAULT_APP_UUID or None,
             "authRequired": bool(WEBHOOK_TOKEN),
             "mcpServers": mcp_status,
+            "deploymentServer": {
+                "name": DEPLOY_MCP,
+                "connected": bool(deploy_status.get("connected")),
+                "error": deploy_status.get("error"),
+            },
         },
     )
+
+
+@app.get("/environments")
+async def environments():
+    """List the deployment environments the Deployment MCP is configured for.
+
+    Powers the target-environment picker on the board. Returns an empty list
+    (not an error) when the Deployment MCP is unavailable, so the UI can show a
+    disabled control rather than break.
+    """
+    try:
+        result = await hub.call(DEPLOY_MCP, "list_environments", {})
+    except (McpError, WorkflowError) as exc:
+        return {"environments": [], "available": False, "detail": str(exc)}
+    return {"environments": normalize_env_names(result), "available": True}
 
 
 @app.get("/mcp/tools")

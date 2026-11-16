@@ -108,7 +108,7 @@ def default_config_paths(workspace_root: Path | str | None = None) -> list[Path]
     Mirrors the IDE's own precedence: the user-level config is overridden by the
     workspace config, so a workspace may point at a different Appian environment.
     """
-    root = Path(workspace_root) if workspace_root else Path(__file__).resolve().parent.parent
+    root = Path(workspace_root) if workspace_root else Path(__file__).resolve().parent
     return [
         Path.home() / ".kiro" / "settings" / "mcp.json",
         root / ".kiro" / "settings" / "mcp.json",
