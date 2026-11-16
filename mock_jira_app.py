@@ -151,9 +151,33 @@ class StatusChange(BaseModel):
         return value.strip().casefold()
 
 
+class DeployTrigger(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_env: str = Field(..., min_length=1, max_length=120)
+
+
+class DeployResult(BaseModel):
+    """Outcome of an on-demand deploy of a packaged run, shown on the card."""
+
+    state: Literal["idle", "deploying", "succeeded", "needs_attention", "failed"] = "idle"
+    http_status: int | None = None
+    target_env: str | None = None
+    export_uuid: str | None = None
+    deploy_uuid: str | None = None
+    inspection_uuid: str | None = None
+    steps: list[dict[str, Any]] = Field(default_factory=list)
+    deploy_log: str | None = None
+    error: str | None = None
+    error_code: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
 class RunResult(BaseModel):
     state: Literal["idle", "sending", "succeeded", "failed"] = "idle"
     http_status: int | None = None
+    run_id: str | None = None
     package_name: str | None = None
     package_uuid: str | None = None
     selected: list[dict[str, Any]] = Field(default_factory=list)
@@ -164,6 +188,7 @@ class RunResult(BaseModel):
     sent_payload: dict[str, Any] | None = None
     started_at: str | None = None
     finished_at: str | None = None
+    deploy: DeployResult = Field(default_factory=DeployResult)
 
 
 class Ticket(BaseModel):
@@ -291,6 +316,7 @@ async def fire_webhook(ticket: Ticket) -> None:
 
     run = body.get("run") or {}
     ticket.run.http_status = resp.status_code
+    ticket.run.run_id = run.get("run_id")
     ticket.run.selected = run.get("selected") or []
     ticket.run.steps = run.get("steps") or []
     ticket.run.unresolved = run.get("unresolved") or []
@@ -311,6 +337,63 @@ async def fire_webhook(ticket: Ticket) -> None:
         ticket.run.error_code = body.get("error_code") or run.get("error_code") or "error"
         ticket.run.error = body.get("error") or run.get("error") or f"HTTP {resp.status_code}"
         log.warning("%s failed: [%s] %s", ticket.ticket_id, ticket.run.error_code, ticket.run.error)
+
+
+async def fire_deploy(ticket: Ticket, target_env: str) -> None:
+    """Ask the orchestrator to deploy this ticket's packaged run to target_env."""
+    run_id = ticket.run.run_id
+    ticket.run.deploy = DeployResult(
+        state="deploying", target_env=target_env,
+        started_at=datetime.now(timezone.utc).isoformat(),
+    )
+    headers = {"X-Webhook-Token": WEBHOOK_TOKEN} if WEBHOOK_TOKEN else {}
+    log.info("%s -> deploy to %s (run %s)", ticket.ticket_id, target_env, run_id)
+
+    try:
+        async with httpx.AsyncClient(timeout=600.0, headers=headers) as client:
+            resp = await client.post(
+                f"{ORCHESTRATOR_URL}/runs/{run_id}/deploy",
+                json={"target_env": target_env},
+                params={"sync": "true"},
+            )
+    except httpx.HTTPError as exc:
+        ticket.run.deploy.state = "failed"
+        ticket.run.deploy.error_code = "unreachable"
+        ticket.run.deploy.error = f"Could not reach the orchestrator: {exc}"
+        ticket.run.deploy.finished_at = datetime.now(timezone.utc).isoformat()
+        log.error("%s deploy failed: %s", ticket.ticket_id, exc)
+        return
+
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {"error": resp.text[:500]}
+
+    run = body.get("run") or {}
+    d = ticket.run.deploy
+    d.http_status = resp.status_code
+    d.target_env = run.get("deploy_target_env") or target_env
+    d.export_uuid = run.get("export_uuid")
+    d.deploy_uuid = run.get("deploy_uuid")
+    d.inspection_uuid = run.get("inspection_uuid")
+    d.steps = run.get("deploy_steps") or []
+    d.deploy_log = run.get("deploy_log")
+    d.finished_at = datetime.now(timezone.utc).isoformat()
+
+    deploy_state = run.get("deploy_state")
+    if resp.status_code == 200 and deploy_state == "succeeded":
+        d.state = "succeeded"
+        log.info("%s deployed to %s as %s", ticket.ticket_id, d.target_env, d.deploy_uuid)
+    elif deploy_state == "needs_attention":
+        d.state = "needs_attention"
+        d.error_code = "needs_attention"
+        d.error = "Inspection reported problems the auto-fix could not resolve; deploy withheld."
+        log.warning("%s deploy needs attention", ticket.ticket_id)
+    else:
+        d.state = "failed"
+        d.error_code = body.get("error_code") or run.get("deploy_error_code") or "error"
+        d.error = body.get("error") or run.get("deploy_error") or f"HTTP {resp.status_code}"
+        log.warning("%s deploy failed: [%s] %s", ticket.ticket_id, d.error_code, d.error)
 
 
 def _spawn(coro) -> None:
@@ -357,6 +440,17 @@ async def get_health():
         "status": data.get("status"),
         "mcpServers": data.get("mcpServers") or {},
     }
+
+
+@app.get("/api/environments")
+async def get_environments():
+    """Proxy the orchestrator's deployment environments for the target picker."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            data = (await client.get(f"{ORCHESTRATOR_URL}/environments")).json()
+    except httpx.HTTPError as exc:
+        return {"environments": [], "available": False, "detail": str(exc)}
+    return data
 
 
 @app.get("/api/tickets")
@@ -419,6 +513,21 @@ async def retry_ticket(ticket_id: str) -> Ticket:
     ticket = store.get(ticket_id)
     ticket.status = TRIGGER_STATUS
     _spawn(fire_webhook(ticket))
+    return ticket
+
+
+@app.post("/api/tickets/{ticket_id}/deploy")
+async def deploy_ticket(ticket_id: str, change: "DeployTrigger") -> Ticket:
+    """Deploy this ticket's packaged run to the chosen target environment."""
+    ticket = store.get(ticket_id)
+    if ticket.run.state != "succeeded" or not ticket.run.run_id:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "This ticket has no successfully packaged run to deploy. Package it first.",
+        )
+    if ticket.run.deploy.state == "deploying":
+        raise HTTPException(status.HTTP_409_CONFLICT, "A deploy is already in progress.")
+    _spawn(fire_deploy(ticket, change.target_env))
     return ticket
 
 
@@ -560,6 +669,15 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .result.ok { color: var(--green); }
   .result.bad { color: var(--red); }
   .result b { display: block; margin-bottom: 4px; }
+  .deploy { margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 7px; font-size: 11px; color: var(--muted); }
+  .deploy.ok { color: var(--green); }
+  .deploy.warn { color: var(--amber); }
+  .deploy.bad { color: var(--red); }
+  .deploy b { display: block; margin-bottom: 3px; }
+  .dep-steps { font-size: 10px; }
+  .deploy-ctl { margin-top: 8px; display: flex; gap: 6px; align-items: center; }
+  .deploy-ctl select.dep-env { font-size: 11px; padding: 3px 6px; flex: 1; }
+  .deploy-ctl button { padding: 3px 10px; font-size: 11px; }
   .objlist { margin: 5px 0 0; padding: 0; list-style: none; }
   .objlist li { display: flex; gap: 5px; align-items: baseline; padding: 2px 0; color: var(--ink); }
   .objlist .d0 { color: var(--purple); font-weight: 600; }
@@ -711,6 +829,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 const $ = (id) => document.getElementById(id);
 let CONFIG = null;
 let TICKETS = [];
+let ENVIRONMENTS = [];
 let polling = false;
 
 function toast(msg, bad) {
@@ -792,11 +911,65 @@ async function loadHealth() {
   }
 }
 
+async function loadEnvironments() {
+  try {
+    const e = await api('/api/environments');
+    ENVIRONMENTS = (e && e.available && Array.isArray(e.environments)) ? e.environments : [];
+  } catch (_) {
+    ENVIRONMENTS = [];
+  }
+}
+
 function cardClass(t) {
   if (t.run.state === 'sending') return 'busy';
   if (t.run.state === 'succeeded') return 'ok';
   if (t.run.state === 'failed') return 'bad';
   return '';
+}
+
+function renderDeploy(t) {
+  const d = t.run.deploy || {state: 'idle'};
+  const envs = ENVIRONMENTS || [];
+
+  // Live progress.
+  if (d.state === 'deploying') {
+    return '<div class="deploy"><span class="spin"></span> deploying to '
+      + esc(d.target_env || '') + '&hellip;</div>';
+  }
+
+  // Outcome sections.
+  let outcome = '';
+  if (d.state === 'succeeded') {
+    outcome = '<div class="deploy ok"><b>\u2713 Deployed to ' + esc(d.target_env || '')
+      + '</b>' + deploySteps(d) + '</div>';
+  } else if (d.state === 'needs_attention') {
+    outcome = '<div class="deploy warn"><b>\u26a0 Needs attention \u00b7 ' + esc(d.target_env || '')
+      + '</b><div>' + esc(d.error || 'Inspection reported problems; deploy withheld.')
+      + '</div>' + deploySteps(d) + '</div>';
+  } else if (d.state === 'failed') {
+    outcome = '<div class="deploy bad"><b>\u2717 Deploy failed \u00b7 '
+      + esc(d.error_code || 'error') + '</b><div>' + esc(d.error || '') + '</div>'
+      + deploySteps(d) + '</div>';
+  }
+
+  // The deploy control: a target picker + button. Disabled when no envs known.
+  const opts = envs.map(e => '<option value="' + esc(e) + '">' + esc(e) + '</option>').join('');
+  const picker = envs.length
+    ? '<select class="dep-env" aria-label="Target environment for ' + esc(t.ticket_id) + '">'
+      + opts + '</select>'
+      + '<button data-act="deploy">'
+      + (d.state === 'idle' ? 'Deploy' : 'Re-deploy') + '</button>'
+    : '<span class="hint">no deploy environments configured</span>';
+
+  const control = '<div class="deploy-ctl">' + picker + '</div>';
+  return outcome + control;
+}
+
+function deploySteps(d) {
+  const steps = (d.steps || []).map(s =>
+    '<li><span class="s s-' + esc(s.status) + '">' + esc(s.status) + '</span>'
+    + '<span>' + esc(s.name) + '</span></li>').join('');
+  return steps ? '<ul class="objlist dep-steps">' + steps + '</ul>' : '';
 }
 
 function renderResult(t) {
@@ -817,7 +990,8 @@ function renderResult(t) {
            + '<span class="badge">' + esc(why) + '</span>' + conf + '</li>';
     }).join('');
     return '<div class="result ok"><b>\u2713 ' + esc(r.package_name || 'Package created')
-         + ' \u00b7 ' + r.selected.length + ' objects</b><ul class="objlist">' + items + '</ul></div>';
+         + ' \u00b7 ' + r.selected.length + ' objects</b><ul class="objlist">' + items + '</ul>'
+         + renderDeploy(t) + '</div>';
   }
   if (r.state === 'failed') {
     const un = (r.unresolved || []).map(u =>
@@ -907,6 +1081,10 @@ function render() {
           if (act === 'delete') remove(t.ticket_id);
           if (act === 'retry') retry(t.ticket_id);
           if (act === 'detail') showDetail(t.ticket_id);
+          if (act === 'deploy') {
+            const sel = card.querySelector('.dep-env');
+            deploy(t.ticket_id, sel ? sel.value : null);
+          }
         });
       });
 
@@ -929,11 +1107,16 @@ function render() {
   }
 }
 
+function anyBusy() {
+  return TICKETS.some(t => t.run.state === 'sending'
+    || (t.run.deploy && t.run.deploy.state === 'deploying'));
+}
+
 async function refresh() {
   try {
     TICKETS = await api('/api/tickets');
     render();
-    if (TICKETS.some(t => t.run.state === 'sending')) schedulePoll();
+    if (anyBusy()) schedulePoll();
   } catch (e) {
     toast('Could not load tickets: ' + e.message, true);
   }
@@ -947,7 +1130,7 @@ function schedulePoll() {
       TICKETS = await api('/api/tickets');
       render();
     } catch (e) { /* keep polling */ }
-    if (TICKETS.some(t => t.run.state === 'sending')) {
+    if (anyBusy()) {
       setTimeout(tick, 1500);
     } else {
       polling = false;
@@ -984,6 +1167,20 @@ async function retry(id) {
   } catch (e) { toast('Retry failed: ' + e.message, true); }
 }
 
+async function deploy(id, env) {
+  if (!env) { toast('No target environment selected', true); return; }
+  try {
+    await api('/api/tickets/' + encodeURIComponent(id) + '/deploy', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({target_env: env}),
+    });
+    toast(id + ' \u2192 deploying to ' + env);
+    await refresh();
+    schedulePoll();
+  } catch (e) { toast('Deploy failed: ' + e.message, true); }
+}
+
 async function remove(id) {
   try {
     await api('/api/tickets/' + encodeURIComponent(id), {method: 'DELETE'});
@@ -999,7 +1196,18 @@ function showDetail(id) {
     '<li><span class="s s-' + esc(s.status) + '">' + esc(s.status) + '</span>'
     + '<span class="n">' + esc(s.name) + '</span>'
     + '<span>' + esc(s.detail || '') + '</span></li>').join('');
-  $('dlg-steps').innerHTML = steps || '<li>No steps recorded.</li>';
+  const d = t.run.deploy || {};
+  const depSteps = (d.steps || []).map(s =>
+    '<li><span class="s s-' + esc(s.status) + '">' + esc(s.status) + '</span>'
+    + '<span class="n">' + esc(s.name) + '</span>'
+    + '<span>' + esc(s.detail || '') + '</span></li>').join('');
+  const depBlock = (d.state && d.state !== 'idle')
+    ? '<h4 style="margin:14px 0 8px; font-size:12px; text-transform:uppercase; color:var(--muted)">'
+      + 'Deploy (' + esc(d.state) + (d.target_env ? ' \u2192 ' + esc(d.target_env) : '') + ')</h4>'
+      + '<ul class="steps">' + (depSteps || '<li>No deploy steps.</li>') + '</ul>'
+      + (d.deploy_log ? '<pre style="max-height:240px">' + esc(d.deploy_log) + '</pre>' : '')
+    : '';
+  $('dlg-steps').innerHTML = (steps || '<li>No steps recorded.</li>') + depBlock;
   $('dlg-payload').textContent = JSON.stringify(t.run.sent_payload || {}, null, 2);
   $('detail').showModal();
 }
@@ -1050,9 +1258,11 @@ $('dlg-close').addEventListener('click', () => $('detail').close());
 
 (async function init() {
   await loadConfig();
+  await loadEnvironments();
   await refresh();
   await loadHealth();
   setInterval(loadHealth, 20000);
+  setInterval(loadEnvironments, 20000);
 })();
 </script>
 </body>
